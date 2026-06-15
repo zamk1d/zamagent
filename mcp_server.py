@@ -1,21 +1,11 @@
 import sys
 import json
-
-def read_file(filepath):
-    try:
-        with open(filepath, "r") as f:
-            return {
-                "status": "ok",
-                "result": f.read()
-            }
-    except FileNotFoundError:
-        return {
-            "status": "error",
-            "result": "file not found"
-        }
+import tools
 
 TOOLS = {
-    "read_file": read_file,
+    name: obj
+    for name, obj in vars(tools).items()
+    if callable(obj)
 }
 
 for line in sys.stdin:
