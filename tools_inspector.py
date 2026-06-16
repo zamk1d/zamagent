@@ -1,8 +1,13 @@
+from pathlib import Path
 import ast
+
+BASE_DIR = Path(__file__).parent
+
+TOOLS_FILE = BASE_DIR / "tools.py"
 
 def get_tools_list():
     tools = {}
-    with open("tools.py", encoding="utf-8") as f:
+    with open(TOOLS_FILE, encoding="utf-8") as f:
         tree = ast.parse(f.read())
 
     for node in tree.body:
