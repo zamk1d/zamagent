@@ -2,6 +2,7 @@
 LLM providers for zamagent.
 
 * GroqProvider    - Groq Cloud (OpenAI-compatible, native tool calling, SSE streaming)
+* NvidiaProvider  - NVIDIA NIM / build.nvidia.com (OpenAI-compatible, NVIDIA_API_KEY)
 * OllamaProvider  - local Ollama (/api/chat, native tool calling)
 * OpenAICompatProvider - any other OpenAI-compatible endpoint (OPENAI_BASE_URL)
 
@@ -14,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -31,6 +33,55 @@ notice: Callable[[str], None] | None = None
 def _say(msg: str) -> None:
     if notice:
         notice(msg)
+
+
+# --- debugging: AGENT_DEBUG=1 or --debug; details go to zamagent-debug.log ----
+DEBUG = os.getenv("AGENT_DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
+DEBUG_LOG = os.path.join(BASE_DIR, "zamagent-debug.log")
+READ_TIMEOUT = float(os.getenv("AGENT_TIMEOUT", "90") or 90)   # max silence from the server, seconds
+MAX_TIMEOUT_RETRIES = 1
+
+
+def set_debug(on: bool = True) -> None:
+    global DEBUG
+    DEBUG = on
+
+
+def _dbg(msg: str, console: bool = True) -> None:
+    """Debug line -> log file (always when DEBUG) and, optionally, the console."""
+    if not DEBUG:
+        return
+    line = f"{time.strftime('%H:%M:%S')} {msg}"
+    try:
+        with open(DEBUG_LOG, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
+    if console:
+        _say("debug: " + msg[:200].replace("[", "(").replace("]", ")"))
+
+
+class _Heartbeat:
+    """Tells the user what we are waiting for, so a slow server does not look like a hang."""
+
+    def __init__(self, what: str, state=None):
+        self.what, self.state = what, state
+        self._stop = threading.Event()
+        self._t0 = time.monotonic()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self) -> None:
+        every = 10 if DEBUG else 15
+        while not self._stop.wait(every):
+            extra = f" ({self.state()})" if self.state else ""
+            _say(f"still waiting for {self.what}: {time.monotonic() - self._t0:.0f}s{extra}")
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
 
 
 # --------------------------------------------------------------------------- #
@@ -73,14 +124,21 @@ GROQ_ALIASES = {
     "smart": "openai/gpt-oss-120b",
     "oss": "openai/gpt-oss-120b",
     "oss-small": "openai/gpt-oss-20b",
-    "llama": "llama-3.3-70b-versatile",
-    "fast": "llama-3.1-8b-instant",
+    "llama": "qwen/qwen3.6-27b",        # llama-3.3-70b-versatile was retired 2026-08-16
+    "qwen": "qwen/qwen3.6-27b",
+    "fast": "openai/gpt-oss-20b",       # llama-3.1-8b-instant was retired 2026-08-16
 }
+
+# NVIDIA retires free-endpoint models constantly (HTTP 410), so no hardcoded aliases:
+# the default model is auto-detected (see NvidiaProvider). Use -m <full id> to pin one.
+NVIDIA_ALIASES: dict[str, str] = {}
+
+_ALIASES = {"groq": GROQ_ALIASES, "nvidia": NVIDIA_ALIASES}
 
 
 def resolve_model(provider: str, model: str | None) -> str | None:
-    if model and provider == "groq":
-        return GROQ_ALIASES.get(model.lower(), model)
+    if model and provider in _ALIASES:
+        return _ALIASES[provider].get(model.lower(), model)
     return model
 
 
@@ -92,6 +150,10 @@ class ProviderError(Exception):
     def __init__(self, message: str, status: int | None = None):
         super().__init__(message)
         self.status = status
+
+
+class ProviderTimeout(ProviderError):
+    """The server did not answer (or went silent) for AGENT_TIMEOUT seconds."""
 
 
 class ToolUseFailed(ProviderError):
@@ -184,11 +246,59 @@ class Provider:
 # OpenAI-compatible (Groq is a subclass)                                       #
 # --------------------------------------------------------------------------- #
 
+def _stream_chunk(provider, data: str, parts: list, calls: dict, usage: dict,
+                  on_token, stats: dict) -> bool:
+    """Handle one SSE data payload. Mutates parts/calls/usage. Returns True to stop."""
+    try:
+        chunk = json.loads(data)
+    except json.JSONDecodeError:
+        _dbg(f"bad json chunk: {data[:200]!r}", console=False)
+        return False
+
+    if chunk.get("error"):
+        err = chunk["error"]
+        _dbg(f"error chunk: {err}", console=False)
+        if isinstance(err, dict) and err.get("code") == "tool_use_failed":
+            raise ToolUseFailed(err.get("message", ""), err.get("failed_generation", ""))
+        raise ProviderError(str(err.get("message", err)) if isinstance(err, dict) else str(err))
+
+    u = chunk.get("usage") or (chunk.get("x_groq") or {}).get("usage")
+    if u:
+        usage.update(u)
+
+    for choice in chunk.get("choices") or []:
+        if choice.get("finish_reason"):
+            stats["finish"] = choice["finish_reason"]
+        delta = choice.get("delta") or {}
+        text = delta.get("content")
+        if text:
+            if stats["first_text"] is None:
+                stats["first_text"] = time.monotonic() - stats["t0"]
+                _dbg(f"first text token after {stats['first_text']:.1f}s")
+            parts.append(text)
+            if on_token:
+                on_token(text)
+        for tc in delta.get("tool_calls") or []:
+            entry = calls.setdefault(tc.get("index", 0), {"id": "", "name": "", "args": ""})
+            if tc.get("id"):
+                entry["id"] = tc["id"]
+            fn = tc.get("function") or {}
+            if fn.get("name") and not entry["name"]:
+                entry["name"] = fn["name"]
+            piece = fn.get("arguments")
+            if isinstance(piece, dict):
+                piece = json.dumps(piece)
+            if piece:
+                entry["args"] += piece
+    return False
+
+
 class OpenAICompatProvider(Provider):
     name = "openai"
     default_base_url = "https://api.openai.com/v1"
     env_key = "OPENAI_API_KEY"
     env_base_url = "OPENAI_BASE_URL"
+    key_hint = ""
 
     def __init__(self, model: str, base_url: str | None = None,
                  api_key: str | None = None, temperature: float = 0.2):
@@ -213,22 +323,45 @@ class OpenAICompatProvider(Provider):
     def _post(self, payload: dict) -> requests.Response:
         url = f"{self.base_url}/chat/completions"
         delay = 1.5
+        timeouts = 0
+        size = len(json.dumps(payload, ensure_ascii=False))
         for attempt in range(1, MAX_RETRIES + 1):
+            t0 = time.monotonic()
+            _dbg(f"POST {url} model={self.model} messages={len(payload['messages'])} "
+                 f"tools={len(payload.get('tools') or [])} body={size} bytes "
+                 f"timeout=10s connect/{READ_TIMEOUT:.0f}s read attempt={attempt}")
             try:
-                resp = requests.post(url, headers=self._headers(), json=payload,
-                                     stream=True, timeout=(10, 180))
-            except (requests.ConnectionError, requests.Timeout) as exc:
+                with _Heartbeat(f"{self.model} to start answering"):
+                    resp = requests.post(url, headers=self._headers(), json=payload,
+                                         stream=True, timeout=(10, READ_TIMEOUT))
+            except requests.Timeout as exc:
+                kind = "connect" if isinstance(exc, requests.ConnectTimeout) else "read"
+                _dbg(f"TIMEOUT ({kind}) after {time.monotonic() - t0:.1f}s: {exc}")
+                timeouts += 1
+                if timeouts > MAX_TIMEOUT_RETRIES or attempt == MAX_RETRIES:
+                    raise ProviderTimeout(
+                        f"no response from {self.model} for {READ_TIMEOUT:.0f}s ({kind} timeout). "
+                        f"The server is overloaded or queueing the request. "
+                        f"Try another model (-m), raise AGENT_TIMEOUT, or run with --debug.")
+                _say(f"{self.model}: no answer in {READ_TIMEOUT:.0f}s, retry {timeouts}/{MAX_TIMEOUT_RETRIES}")
+                continue
+            except requests.ConnectionError as exc:
+                _dbg(f"CONNECTION ERROR after {time.monotonic() - t0:.1f}s: {type(exc).__name__}: {exc}")
                 if attempt == MAX_RETRIES:
                     raise ProviderError(f"connection failed: {exc}")
-                _say(f"connection problem, retry {attempt}/{MAX_RETRIES}")
+                _say(f"connection problem ({type(exc).__name__}), retry {attempt}/{MAX_RETRIES}")
                 time.sleep(delay)
                 delay *= 2
                 continue
 
+            interesting = {k: v for k, v in resp.headers.items()
+                           if k.lower().startswith(("x-", "nvcf", "retry", "server", "cf-", "content-type"))}
+            _dbg(f"HTTP {resp.status_code} after {time.monotonic() - t0:.1f}s headers={interesting}")
             if resp.status_code == 200:
                 return resp
 
             message, code, failed = _error_info(resp)
+            _dbg(f"error body: {message[:1500]}", console=False)
             status = resp.status_code
             resp.close()
 
@@ -240,7 +373,7 @@ class OpenAICompatProvider(Provider):
                 src = ENV_SOURCES.get(self.env_key, "the shell environment (not .env!)")
                 raise ProviderError(
                     f"401 {message}. {self.env_key} was taken from {src}: {len(key)} chars, "
-                    f"starts with {key[:4]!r}, ends with {key[-2:]!r}. Groq keys start with 'gsk_'. "
+                    f"starts with {key[:4]!r}, ends with {key[-2:]!r}. {self.key_hint} "
                     f"If it comes from the shell, remove it (bash: unset {self.env_key} / "
                     f"fish: set -e {self.env_key}) so .env is used.", 401)
 
@@ -277,53 +410,46 @@ class OpenAICompatProvider(Provider):
         parts: list[str] = []
         calls: dict[int, dict] = {}
         usage: dict = {}
+        stats = {"t0": time.monotonic(), "chunks": 0, "keepalive": 0, "last": time.monotonic(),
+                 "first_data": None, "first_text": None, "finish": None}
+
+        def _state() -> str:
+            return (f"{stats['chunks']} chunks, {len(parts)} text parts, "
+                    f"last data {time.monotonic() - stats['last']:.0f}s ago")
+
         try:
-            for raw in resp.iter_lines():
-                if not raw:
-                    continue
-                line = raw.decode("utf-8", "replace")
-                if not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if data == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data)
-                except json.JSONDecodeError:
-                    continue
-
-                if chunk.get("error"):
-                    err = chunk["error"]
-                    if isinstance(err, dict) and err.get("code") == "tool_use_failed":
-                        raise ToolUseFailed(err.get("message", ""), err.get("failed_generation", ""))
-                    raise ProviderError(str(err.get("message", err)) if isinstance(err, dict) else str(err))
-
-                u = chunk.get("usage") or (chunk.get("x_groq") or {}).get("usage")
-                if u:
-                    usage = u
-
-                for choice in chunk.get("choices") or []:
-                    delta = choice.get("delta") or {}
-                    text = delta.get("content")
-                    if text:
-                        parts.append(text)
-                        if on_token:
-                            on_token(text)
-                    for tc in delta.get("tool_calls") or []:
-                        entry = calls.setdefault(
-                            tc.get("index", 0), {"id": "", "name": "", "args": ""})
-                        if tc.get("id"):
-                            entry["id"] = tc["id"]
-                        fn = tc.get("function") or {}
-                        if fn.get("name") and not entry["name"]:
-                            entry["name"] = fn["name"]
-                        piece = fn.get("arguments")
-                        if isinstance(piece, dict):
-                            piece = json.dumps(piece)
-                        if piece:
-                            entry["args"] += piece
+            with _Heartbeat(f"{self.model} stream", _state):
+              try:
+                lines = resp.iter_lines()
+                for raw in lines:
+                    stats["last"] = time.monotonic()
+                    if not raw:
+                        continue
+                    line = raw.decode("utf-8", "replace")
+                    if not line.startswith("data:"):
+                        stats["keepalive"] += 1
+                        _dbg(f"non-data line: {line[:120]!r}", console=False)
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    stats["chunks"] += 1
+                    if stats["first_data"] is None:
+                        stats["first_data"] = time.monotonic() - stats["t0"]
+                        _dbg(f"first data chunk after {stats['first_data']:.1f}s (body read)")
+                    if _stream_chunk(self, data, parts, calls, usage, on_token, stats):
+                        break
+              except requests.Timeout as exc:
+                _dbg(f"STREAM STALLED: no data for {READ_TIMEOUT:.0f}s ({_state()}): {exc}")
+                raise ProviderTimeout(
+                    f"{self.model} went silent for {READ_TIMEOUT:.0f}s mid-answer ({_state()}).")
+              except requests.ConnectionError as exc:
+                _dbg(f"STREAM CONNECTION ERROR: {type(exc).__name__}: {exc} ({_state()})")
+                raise ProviderError(f"connection dropped mid-answer: {exc}")
         finally:
             resp.close()
+            _dbg(f"stream done in {time.monotonic() - stats['t0']:.1f}s chunks={stats['chunks']} "
+                 f"keepalive={stats['keepalive']} finish={stats['finish']} usage={usage}")
 
         tool_calls = []
         for idx in sorted(calls):
@@ -353,6 +479,7 @@ class GroqProvider(OpenAICompatProvider):
     default_base_url = "https://api.groq.com/openai/v1"
     env_key = "GROQ_API_KEY"
     env_base_url = "GROQ_BASE_URL"
+    key_hint = "Groq keys start with 'gsk_'."
     tool_result_limit = 10_000
     context_chars = 120_000   # free tier has small TPM limits; override with AGENT_CONTEXT_CHARS
 
@@ -372,6 +499,143 @@ class GroqProvider(OpenAICompatProvider):
                 "and put it into .env (see .env.example)."
             )
         return super()._headers()
+
+
+class NvidiaProvider(OpenAICompatProvider):
+    """NVIDIA NIM API (https://build.nvidia.com). Key: https://build.nvidia.com/settings/api-keys
+
+    NVIDIA removes models from the free endpoint often (HTTP 410 "end of life"), so the
+    default model is "auto": the first request probes the models of /v1/models and picks
+    one that answers and supports tool calling. If the current model turns 410 mid-session,
+    the provider switches to another working one and retries.
+    """
+    name = "nvidia"
+    default_base_url = "https://integrate.api.nvidia.com/v1"
+    env_key = "NVIDIA_API_KEY"
+    env_base_url = "NVIDIA_BASE_URL"
+    key_hint = "NVIDIA keys start with 'nvapi-'."
+    tool_result_limit = 10_000
+    context_chars = 150_000
+
+    AUTO = "auto"
+    # earlier = preferred; matched as substrings of the model id
+    PREFER = ("kimi-k2", "deepseek", "glm", "qwen3", "qwen", "gpt-oss", "mistral",
+              "minimax", "nemotron", "llama", "gemma")
+    SKIP = re.compile(r"embed|rerank|guard|safety|gliner|parse|clip|vl-|-vl|vision|"
+                      r"diffusion|multimodal|whisper|asr|tts|riva|nvclip|reward|retriev|"
+                      r"stable-diffusion|flux|cosmos|segment|ocr|translate|pii", re.I)
+    MAX_PROBES = 20
+
+    def __init__(self, model: str | None = None, **kw):
+        super().__init__(model or self.AUTO, **kw)
+        self._pinned = bool(model) and model != self.AUTO      # user chose the model: never swap it silently on timeouts
+        self._dead: set[str] = set()
+
+    def _headers(self) -> dict:
+        if not self.api_key:
+            raise ProviderError(
+                "NVIDIA_API_KEY is not set. Get a key at https://build.nvidia.com/settings/api-keys "
+                "and put it into .env (see .env.example)."
+            )
+        return super()._headers()
+
+    # -- model discovery ---------------------------------------------------- #
+    def _candidates(self) -> list[str]:
+        ids = [m for m in self.list_models() if m not in self._dead and not self.SKIP.search(m)]
+
+        def rank(m: str) -> int:
+            for i, key in enumerate(self.PREFER):
+                if key in m.lower():
+                    return i
+            return len(self.PREFER)
+        return sorted(ids, key=lambda m: (rank(m), m))
+
+    def _probe(self, model: str, timeout: float = 20) -> bool:
+        """True when the model answers a 1-token request that carries a tool definition."""
+        return self._probe_detail(model, timeout)[0]
+
+    def probe_all(self, limit: int = 30, timeout: float = 30) -> list[tuple[str, str, float, bool]]:
+        """Time a tiny tool-carrying request against many models in parallel.
+        Returns [(model, status, seconds, ok)], working ones first, fastest first."""
+        from concurrent.futures import ThreadPoolExecutor
+        ids = self._candidates()[:limit]
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            rows = list(pool.map(lambda m: self._row(m, timeout), ids))
+        return sorted(rows, key=lambda r: (not r[3], r[2]))
+
+    def _row(self, model: str, timeout: float) -> tuple[str, str, float, bool]:
+        ok, status, secs = self._probe_detail(model, timeout)
+        return (model, status, secs, ok)
+
+    def _probe_detail(self, model: str, timeout: float = 20) -> tuple[bool, str, float]:
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 1,
+            "tools": [{"type": "function", "function": {
+                "name": "noop", "description": "noop",
+                "parameters": {"type": "object", "properties": {}}}}],
+        }
+        t0 = time.monotonic()
+        try:
+            r = requests.post(f"{self.base_url}/chat/completions", headers=self._headers(),
+                              json=payload, timeout=(10, timeout))
+        except requests.Timeout:
+            secs = time.monotonic() - t0
+            _dbg(f"probe {model}: timeout after {secs:.1f}s", console=False)
+            return False, "timeout", secs
+        except requests.RequestException as exc:
+            secs = time.monotonic() - t0
+            _dbg(f"probe {model}: {type(exc).__name__} after {secs:.1f}s", console=False)
+            return False, type(exc).__name__, secs
+        secs = time.monotonic() - t0
+        status = r.status_code
+        _dbg(f"probe {model}: HTTP {status} in {secs:.1f}s body={r.text[:200]!r}", console=False)
+        r.close()
+        return status in (200, 429), str(status), secs   # 429 = exists, just rate limited
+
+    FAST_ENOUGH = 10.0   # seconds a probe may take to still count as "fast"
+
+    def find_working_model(self) -> str:
+        """Probe candidates in parallel; take the most preferred one that answers fast."""
+        _say("nvidia: looking for a fast working model ...")
+        rows = self.probe_all(limit=self.MAX_PROBES, timeout=15)
+        good = [r for r in rows if r[3]]
+        for model, status, secs, ok in rows:
+            if not ok:
+                self._dead.add(model)
+        if not good:
+            raise ProviderError(
+                "no working NVIDIA chat model answered in time (the free endpoint may be "
+                "overloaded). Try again later, or run `python zamagent.py -p nvidia --probe`.")
+        fast = [r for r in good if r[2] <= self.FAST_ENOUGH] or good
+
+        def rank(m: str) -> int:
+            for i, key in enumerate(self.PREFER):
+                if key in m.lower():
+                    return i
+            return len(self.PREFER)
+        best = min(fast, key=lambda r: (rank(r[0]), r[2]))
+        self.model = best[0]
+        _say(f"nvidia: using {best[0]} ({best[2]:.1f}s probe)")
+        return best[0]
+
+    # -- chat with fallback ------------------------------------------------- #
+    def chat(self, messages, tools, on_token=None) -> LLMResponse:
+        if self.model == self.AUTO:
+            self.find_working_model()
+        try:
+            return super().chat(messages, tools, on_token)
+        except ProviderError as exc:
+            gone = exc.status in (404, 410) and not isinstance(exc, ToolUseFailed)
+            slow = isinstance(exc, ProviderTimeout) and not self._pinned
+            if not (gone or slow):
+                raise
+            why = f"is gone ({exc.status})" if gone else "is not answering"
+            _say(f"nvidia: {self.model} {why}, looking for another model")
+            self._dead.add(self.model)
+            self.find_working_model()
+            return super().chat(messages, tools, on_token)
 
 
 # --------------------------------------------------------------------------- #
@@ -482,12 +746,18 @@ class OllamaProvider(Provider):
 # Factory                                                                      #
 # --------------------------------------------------------------------------- #
 
-PROVIDERS = ("groq", "ollama", "openai")
+PROVIDERS = ("groq", "nvidia", "ollama", "openai")
 
 
 def default_provider_name() -> str:
     load_env()
-    return (os.getenv("AGENT_PROVIDER") or ("groq" if os.getenv("GROQ_API_KEY") else "ollama")).lower()
+    if os.getenv("AGENT_PROVIDER"):
+        return os.environ["AGENT_PROVIDER"].lower()
+    if os.getenv("GROQ_API_KEY"):
+        return "groq"
+    if os.getenv("NVIDIA_API_KEY"):
+        return "nvidia"
+    return "ollama"
 
 
 def make_provider(name: str | None = None, model: str | None = None) -> Provider:
@@ -496,6 +766,8 @@ def make_provider(name: str | None = None, model: str | None = None) -> Provider
     model = resolve_model(name, model)
     if name == "groq":
         return GroqProvider(model or os.getenv("GROQ_MODEL") or "openai/gpt-oss-120b")
+    if name == "nvidia":
+        return NvidiaProvider(model or os.getenv("NVIDIA_MODEL") or None)
     if name == "ollama":
         return OllamaProvider(model or os.getenv("OLLAMA_MODEL") or "qwen3:8b")
     if name in ("openai", "custom"):

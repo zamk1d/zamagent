@@ -29,8 +29,8 @@ SESSIONS_DIR = os.path.join(WORK_DIR, ".zamagent", "sessions")
 
 HELP = """\
 [bold]Commands[/bold]
-  [cyan]/model[/cyan] [dim]<name|alias>[/dim]      switch model (groq aliases: smart, oss-small, llama, fast)
-  [cyan]/provider[/cyan] [dim]<groq|ollama|openai> [model][/dim]
+  [cyan]/model[/cyan] [dim]<name|alias>[/dim]      switch model (groq aliases: smart, oss-small, qwen, fast; nvidia: full id)
+  [cyan]/provider[/cyan] [dim]<groq|nvidia|ollama|openai> [model][/dim]
   [cyan]/models[/cyan]                 list models of the current provider
   [cyan]/yes[/cyan]                    toggle auto-approve for shell / run / delete / move
   [cyan]/tools[/cyan]                  list available tools
@@ -334,15 +334,39 @@ def main():
     parser = argparse.ArgumentParser(description="zamagent - your own terminal agent",
                                      epilog="No prompt -> interactive REPL. With a prompt -> run once and exit.")
     parser.add_argument("prompt", nargs="?", help="prompt for a one-shot run")
-    parser.add_argument("-p", "--provider", choices=PROVIDERS, help="groq | ollama | openai (default: groq if GROQ_API_KEY is set, else ollama)")
-    parser.add_argument("-m", "--model", help="model id or alias (groq: smart, oss-small, llama, fast)")
+    parser.add_argument("-p", "--provider", choices=PROVIDERS, help="groq | nvidia | ollama | openai (default: groq if GROQ_API_KEY, else nvidia if NVIDIA_API_KEY, else ollama)")
+    parser.add_argument("-m", "--model", help="model id or alias (groq: smart, oss-small, qwen, fast; nvidia: auto-detected if omitted)")
     parser.add_argument("-y", "--yes", action="store_true", help="auto-approve shell/run/delete/move")
+    parser.add_argument("--debug", action="store_true",
+                        help="verbose request/stream timings on screen + full log in zamagent-debug.log")
+    parser.add_argument("--probe", action="store_true",
+                        help="nvidia: time every chat model in parallel and show which ones answer fast")
     parser.add_argument("--max-steps", type=int, default=25)
     parser.add_argument("--list-models", action="store_true", help="print models of the provider and exit")
     args = parser.parse_args()
+    if args.debug:
+        providers.set_debug(True)
+        console.print(f"[dim]debug on, log: {providers.DEBUG_LOG}[/dim]")
 
     try:
         provider = make_provider(args.provider, args.model)
+        if args.probe:
+            if not hasattr(provider, "probe_all"):
+                console.print("[red]--probe works only with -p nvidia[/red]")
+                sys.exit(1)
+            console.print("[dim]probing models (up to 30s each, 8 in parallel) ...[/dim]")
+            from rich.table import Table
+            table = Table(show_header=True, header_style="bold")
+            for col in ("model", "result", "seconds"):
+                table.add_column(col)
+            rows = provider.probe_all()
+            for model, status, secs, ok in rows:
+                table.add_row(model, f"[green]{status}[/green]" if ok else f"[red]{status}[/red]", f"{secs:.1f}")
+            console.print(table)
+            good = [r for r in rows if r[3]]
+            if good:
+                console.print(f"\nfastest: [bold]python zamagent.py -p nvidia -m {good[0][0]}[/bold]")
+            return
         if args.list_models:
             print("\n".join(provider.list_models()))
             return
