@@ -1,386 +1,366 @@
-import os
-import subprocess
-import json
+"""
+zamagent core: agent loop with native tool calling, memory, safety gates.
+
+Providers live in providers.py (Groq / Ollama / any OpenAI-compatible).
+Tools live in tools.py and are executed in a separate process (mcp_server.py).
+"""
 import atexit
+import datetime
+import json
+import os
+import platform
+import subprocess
+import sys
+import time
 from typing import Callable
 
-import requests
-
-from tools_inspector import get_tools_list
+from providers import Provider, ProviderError, ToolUseFailed
+from tools_inspector import get_tool_schemas
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 WORK_DIR = os.getcwd()
 
-MAX_STEPS = 20
-TOOL_RESULT_TRIM = 2000
+MAX_STEPS = 25
 
-# --------------------------------------------------------------------------- #
-# Callbacks                                                                    #
-# --------------------------------------------------------------------------- #
-
-on_tool_call:   Callable[[str, dict], None] | None = None
-on_tool_result: Callable[[str, dict], None] | None = None
-on_step:        Callable[[int], None]        | None = None
-on_token:       Callable[[str], None]        | None = None
+# Tools that need the user's approval (unless auto_approve / "always" was chosen)
+DANGEROUS = {"run_command", "run_python", "delete_file", "move_file"}
+# Tools that change the workspace (reset the repeated-call detector)
+MUTATING = {"write_file", "append_file", "edit_file", "delete_file", "move_file",
+            "create_directory", "run_command", "run_python"}
 
 
 # --------------------------------------------------------------------------- #
-# MCP subprocess                                                               #
+# Tool process (MCP-style, JSON lines over stdio)                              #
 # --------------------------------------------------------------------------- #
 
-_proc: subprocess.Popen | None = None
+class MCPClient:
+    def __init__(self):
+        self.proc: subprocess.Popen | None = None
+        atexit.register(self.close)
 
+    def _ensure(self) -> subprocess.Popen:
+        if self.proc is None or self.proc.poll() is not None:
+            self.proc = subprocess.Popen(
+                [sys.executable, os.path.join(BASE_DIR, "mcp_server.py")],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=None if os.getenv("ZAMAGENT_DEBUG") else subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                cwd=WORK_DIR,
+            )
+        return self.proc
 
-def _get_proc() -> subprocess.Popen:
-    global _proc
-    if _proc is None or _proc.poll() is not None:
-        _proc = subprocess.Popen(
-            ["python", os.path.join(BASE_DIR, "mcp_server.py")],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            text=True,
-            cwd=WORK_DIR,
-        )
-        atexit.register(_cleanup_proc)
-    return _proc
-
-
-def _cleanup_proc():
-    global _proc
-    if _proc and _proc.poll() is None:
+    def call(self, tool: str, arguments: dict) -> dict:
+        proc = self._ensure()
         try:
-            _proc.stdin.close()
-            _proc.wait(timeout=2)
-        except Exception:
-            _proc.kill()
+            proc.stdin.write(json.dumps({"tool": tool, "arguments": arguments}) + "\n")
+            proc.stdin.flush()
+            line = proc.stdout.readline()
+            if not line:
+                raise RuntimeError("tool server closed unexpectedly")
+            return json.loads(line)
+        except (BrokenPipeError, RuntimeError, json.JSONDecodeError) as exc:
+            self.close()
+            return {"status": "error", "result": f"tool server failed: {exc}"}
 
-
-def call_mcp(tool: str, arguments: dict) -> dict:
-    proc = _get_proc()
-
-    if on_tool_call:
-        on_tool_call(tool, arguments)
-
-    try:
-        proc.stdin.write(json.dumps({"tool": tool, "arguments": arguments}) + "\n")
-        proc.stdin.flush()
-        response_line = proc.stdout.readline()
-        if not response_line:
-            raise RuntimeError("MCP server closed unexpectedly")
-        result = json.loads(response_line)
-    except json.JSONDecodeError as e:
-        global _proc
-        _proc = None
-        raise RuntimeError(f"Invalid MCP response: {e}")
-    except BrokenPipeError:
-        raise RuntimeError("MCP server died, restarting on next call")
-
-    if on_tool_result:
-        on_tool_result(tool, result)
-
-    return result
-
-def render_tools() -> str:
-    tools = get_tools_list()
-    parts = []
-
-    for tool_name, info in tools.items():
-        args = info.get("args", {})
-        args_str = ", ".join(f"{n}: {t}" for n, t in args.items())
-        line = f"- {tool_name}({args_str})"
-
-        if desc := info.get("description"):
-            first_line = desc.strip().splitlines()[0]
-            line += f"\n  Description: {first_line}"
-
-        if ret := info.get("returns"):
-            line += f"\n  Returns: {ret}"
-
-        parts.append(line)
-
-    return "\n\n".join(parts)
-
-
-def _tool_names() -> str:
-    return ", ".join(get_tools_list().keys())
+    def close(self):
+        if self.proc and self.proc.poll() is None:
+            try:
+                self.proc.stdin.close()
+                self.proc.wait(timeout=2)
+            except Exception:
+                self.proc.kill()
+        self.proc = None
 
 
 # --------------------------------------------------------------------------- #
-# LLM                                                                          #
+# Agent                                                                        #
 # --------------------------------------------------------------------------- #
 
-def ask_llm(messages: list) -> str:
-    response = requests.post(
-        "http://localhost:11434/api/chat",
-        json={
-            "model": "qwen3:8b",
-            "messages": messages,
-            "think": False,
-            "stream": True,
-        },
-        stream=True,
-        timeout=(5, None),
-    )
-    response.raise_for_status()
+class Agent:
+    def __init__(self, provider: Provider, auto_approve: bool = False, max_steps: int = MAX_STEPS):
+        self.provider = provider
+        self.auto_approve = auto_approve
+        self.max_steps = max_steps
+        self.messages: list[dict] = []          # persistent conversation memory
+        self.approved: set[str] = set()         # tools approved with "always"
+        self.usage = {"prompt": 0, "completion": 0, "calls": 0}
+        self.mcp = MCPClient()
 
-    chunks: list[str] = []
-    for raw_line in response.iter_lines():
-        if not raw_line:
-            continue
+        # UI callbacks
+        self.on_step: Callable[[int], None] | None = None
+        self.on_token: Callable[[str], None] | None = None
+        self.on_tool_call: Callable[[str, dict], None] | None = None
+        self.on_tool_result: Callable[[str, dict], None] | None = None
+        # returns "y" | "n" | "a"
+        self.confirm: Callable[[str, dict], str] | None = None
+
+    # ------------------------------------------------------------------ #
+    # Prompt                                                              #
+    # ------------------------------------------------------------------ #
+    def _project_notes(self) -> str:
+        for name in ("ZAMAGENT.md", "AGENTS.md"):
+            path = os.path.join(WORK_DIR, name)
+            if os.path.isfile(path):
+                try:
+                    with open(path, encoding="utf-8") as f:
+                        return f"\n## Project instructions ({name})\n{f.read()[:4000]}\n"
+                except OSError:
+                    pass
+        return ""
+
+    def _system(self) -> dict:
         try:
-            chunk = json.loads(raw_line)
-        except json.JSONDecodeError:
-            continue
+            files = sorted(os.listdir(WORK_DIR))
+            listing = ", ".join(files[:40]) + (" ..." if len(files) > 40 else "") if files else "(empty)"
+        except OSError as exc:
+            listing = f"(could not list: {exc})"
 
-        token = chunk.get("message", {}).get("content", "")
-        if token:
-            chunks.append(token)
-            if on_token:
-                on_token(token)
+        prompt = f"""\
+You are zamagent, an autonomous coding and file-system agent running in the user's terminal.
 
-        if chunk.get("done"):
-            break
+Workspace: {WORK_DIR}  (all paths are relative to it; you cannot leave it)
+System: {platform.system()} {platform.release()}, Python {platform.python_version()}
+Date: {datetime.date.today().isoformat()}
+Top-level contents: {listing}
 
-    return "".join(chunks)
+## How to work
+- Understand the request first, then act with the provided tools. Read-only exploration needs no permission.
+- Explore before changing things: tree / find_files / search_in_files / read_file.
+  Big files: read a line range instead of the whole file.
+- Read a file before editing it. edit_file needs an exact, unique old_str; use write_file for new files or full rewrites.
+- Do the minimum needed for the request. No extra files, folders or tests unless asked.
+- Independent tool calls can go in the same turn. If a call needs another call's result, wait for it.
+- After changing code, verify it when that is cheap (run it / run the tests) and fix what breaks.
+- If a tool returns an error, read it and adapt. Never repeat an identical failing call.
+- Shell commands, running code, deleting and moving need the user's approval. If the user denies, do not retry - propose an alternative.
+- Thinking, planning and analysing happen in your head. Only call tools for real workspace actions.
 
+## Answer style
+Reply in the language the user writes in. Be concise: say what you did / found and anything the user must know. Use markdown only when it helps.
+{self._project_notes()}"""
+        return {"role": "system", "content": prompt}
 
-# --------------------------------------------------------------------------- #
-# Prompts                                                                       #
-# --------------------------------------------------------------------------- #
+    # ------------------------------------------------------------------ #
+    # Memory                                                              #
+    # ------------------------------------------------------------------ #
+    def reset(self):
+        self.messages = []
 
-def _system_prompt() -> dict:
-    prompt = f"""\
-You are a file-system agent. You complete tasks by calling tools.
+    def save(self, path: str):
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self.messages, f, ensure_ascii=False)
 
-Current workspace: {WORK_DIR}
+    def load(self, path: str):
+        with open(path, encoding="utf-8") as f:
+            self.messages = json.load(f)
 
-## Available tools (ONLY these exist — do NOT invent others):
+    @staticmethod
+    def _msg_size(m: dict) -> int:
+        n = len(m.get("content") or "")
+        for tc in m.get("tool_calls") or []:
+            n += len(tc["function"]["arguments"])
+        return n
 
-{render_tools()}
+    def _size(self) -> int:
+        return sum(self._msg_size(m) for m in self.messages)
 
-## Strict rules
+    @staticmethod
+    def _shrink(m: dict, keep: int = 300):
+        """Shorten an old message in place (keeps JSON arguments valid)."""
+        if m["role"] == "tool" and len(m.get("content") or "") > keep:
+            m["content"] = m["content"][:keep] + " ...[old result trimmed]"
+        for tc in m.get("tool_calls") or []:
+            try:
+                args = json.loads(tc["function"]["arguments"])
+            except json.JSONDecodeError:
+                continue
+            changed = False
+            for k, v in list(args.items()):
+                if isinstance(v, str) and len(v) > keep:
+                    args[k] = v[:keep] + " ...[trimmed]"
+                    changed = True
+            if changed:
+                tc["function"]["arguments"] = json.dumps(args, ensure_ascii=False)
 
-1. To call tools respond with a raw JSON array and NOTHING else — no text, no markdown. Example:
-   [{{"tool": "name", "arguments": {{"key": "value"}}}}]
-    You must put a JSON into array, even if you calling only one tool per response
+    def _compact(self, force: bool = False):
+        """Keep the history inside the provider's budget."""
+        limit = self.provider.context_chars * (0.35 if force else 1)
+        if self._size() <= limit:
+            return
 
-2. NEVER call a tool that is not listed above. If you call an unknown tool you will
-   get an error. Read the error, then retry using only the listed tools.
+        users = [i for i, m in enumerate(self.messages) if m["role"] == "user"]
+        last_turn = users[-1] if users else 0
+        boundary = len(self.messages) - 3 if force else last_turn
 
-3. You may call multiple tools in one response ONLY if none of them depend on the result of another tool.
-    If a later action requires information from a previous tool result, 
-    call only the first tool and wait for its result before continuing.
+        for m in self.messages[:max(0, boundary)]:
+            self._shrink(m)
 
-4. You MUST read a file before editing it.
-    Never call edit_file without calling read_file first.
+        while self._size() > limit:
+            users = [i for i, m in enumerate(self.messages) if m["role"] == "user"]
+            if len(users) < 2:
+                break
+            del self.messages[:users[1]]     # drop the oldest turn as a whole
 
-5. You receive each tool result before deciding the next step. Use the result.
+    def _trim_tool_result(self, result: dict) -> str:
+        limit = self.provider.tool_result_limit
+        text = json.dumps(result, ensure_ascii=False)
+        if len(text) <= limit:
+            return text
+        payload = result.get("result")
+        note = f"\n... [trimmed, {len(text)} chars total; use start_line/end_line or search_in_files for the rest]"
+        if isinstance(payload, str):
+            return json.dumps({**result, "result": payload[:limit] + note}, ensure_ascii=False)
+        return text[:limit] + note
 
-6. All file paths must be relative. Never go outside the workspace.
+    # ------------------------------------------------------------------ #
+    # Tool execution                                                      #
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _coerce(props: dict, args: dict) -> dict:
+        """Models often send '5' for ints, null for optionals, numbers for strings."""
+        out = {}
+        for key, val in args.items():
+            if val is None:
+                continue
+            kind = (props.get(key) or {}).get("type")
+            if kind == "integer" and isinstance(val, str) and val.strip().lstrip("-").isdigit():
+                val = int(val)
+            elif kind == "integer" and isinstance(val, float) and val.is_integer():
+                val = int(val)
+            elif kind == "boolean" and isinstance(val, str):
+                val = val.strip().lower() in ("true", "1", "yes")
+            elif kind == "string" and not isinstance(val, str):
+                val = json.dumps(val, ensure_ascii=False) if isinstance(val, (dict, list)) else str(val)
+            elif kind == "array" and isinstance(val, str):
+                try:
+                    val = json.loads(val)
+                except json.JSONDecodeError:
+                    pass
+            out[key] = val
+        return out
 
-7. Before editing a file you have not read yet — read it first with read_file,
-   so you know the exact content to put in old_str.
+    def _execute(self, call: dict, schemas: dict, seen: dict) -> dict:
+        name, args = call["name"], call["arguments"]
 
-8. YOU MUST ALWAYS respond with JSON array for tool calls.
-    If not calling tool → respond with plain text only.
+        if name not in schemas:
+            result = {"status": "error",
+                      "result": f"unknown tool {name!r}. Available: {', '.join(schemas)}"}
+            if self.on_tool_result:
+                self.on_tool_result(name, result)
+            return result
 
-9. You MUST use your own reasoning abilities.
+        if args is None:
+            result = {"status": "error",
+                      "result": "arguments were not valid JSON. Call the tool again with a valid JSON object."}
+            if self.on_tool_call:
+                self.on_tool_call(name, {})
+            if self.on_tool_result:
+                self.on_tool_result(name, result)
+            return result
 
-    Reading, analyzing, comparing, planning and deciding what to do next
-    are NOT tool calls.
-    
-    Tools exist only to interact with the workspace
-    (read files, write files, execute code, etc.).
-    
-    Never invent tools such as:
-    analyze, think, reason, summarize, inspect, decide, plan.
-    
-    Those actions happen internally.
+        args = self._coerce(schemas[name]["properties"], args)
+        if self.on_tool_call:
+            self.on_tool_call(name, args)
 
-10. Never ask yourself to use a reasoning tool.
+        sig = (name, json.dumps(args, sort_keys=True, ensure_ascii=False))
+        seen[sig] = seen.get(sig, 0) + 1
+        if seen[sig] >= 3:
+            result = {"status": "error",
+                      "result": "loop detected: this exact call was already made 3 times with no change in between. "
+                                "Use the earlier results, try a different approach, or give your final answer."}
+        elif name in DANGEROUS and not self.auto_approve and name not in self.approved:
+            decision = self.confirm(name, args) if self.confirm else "n"
+            if decision == "a":
+                self.approved.add(name)
+            if decision in ("y", "a"):
+                result = self.mcp.call(name, args)
+            else:
+                result = {"status": "error", "result": "the user denied this action"}
+        else:
+            result = self.mcp.call(name, args)
 
-    Bad:
-    {{"tool":"analyze"}}
-    
-    Bad:
-    {{"tool":"think"}}
-    
-    Bad:
-    {{"tool":"inspect"}}
-    
-    You already have reasoning abilities internally.
-    Only output tool calls for real workspace actions.
+        if name in MUTATING:
+            seen.clear()
+        if self.on_tool_result:
+            self.on_tool_result(name, result)
+        return result
 
-11. When you are done — respond in plain text (not JSON). Be concise.
+    # ------------------------------------------------------------------ #
+    # Main loop                                                           #
+    # ------------------------------------------------------------------ #
+    def run(self, user_input: str) -> str:
+        start = len(self.messages)
+        self.messages.append({"role": "user", "content": user_input})
+        try:
+            return self._loop()
+        except BaseException:
+            del self.messages[start:]        # never leave a half-finished turn in memory
+            raise
 
-12. Before taking any action, identify the user's exact requested outcome.
+    def _loop(self) -> str:
+        tool_defs = get_tool_schemas()
+        schemas = {t["function"]["name"]: t["function"]["parameters"] for t in tool_defs}
+        seen: dict = {}
+        malformed = 0
+        shrunk_retry = False
 
-    Do NOT perform extra work.
-    
-    If the user asks to modify an existing file:
-    - modify only that file;
-    - do not create additional files unless explicitly requested;
-    - do not create directories;
-    - do not execute tests unless explicitly requested.
-    
-    Only do the minimum actions necessary to satisfy the request.
-"""
-    return {"role": "system", "content": prompt}
+        for step in range(self.max_steps):
+            if self.on_step:
+                self.on_step(step)
+            self._compact()
 
+            try:
+                resp = self.provider.chat([self._system()] + self.messages, tool_defs, self.on_token)
+            except ToolUseFailed:
+                malformed += 1
+                if malformed > 3:
+                    raise
+                self.messages.append({
+                    "role": "user",
+                    "content": "Your last tool call was malformed and was rejected. "
+                               "Call the tool again with valid JSON arguments that match its schema.",
+                })
+                continue
+            except ProviderError as exc:
+                if exc.status == 413 and not shrunk_retry:      # request too large for the model/tier
+                    shrunk_retry = True
+                    self._compact(force=True)
+                    continue
+                raise
 
-def _initial_context() -> dict:
-    """
-    Первое сообщение от 'assistant' с содержимым рабочей директории.
-    Даём агенту контекст сразу, без лишнего tool call на старте.
-    """
-    import os as _os
-    try:
-        files = _os.listdir(WORK_DIR)
-        listing = ", ".join(files) if files else "(empty)"
-    except Exception as e:
-        listing = f"(could not list: {e})"
+            self.usage["calls"] += 1
+            self.usage["prompt"] += int(resp.usage.get("prompt_tokens") or 0)
+            self.usage["completion"] += int(resp.usage.get("completion_tokens") or 0)
 
-    return {
-        "role": "assistant",
-        "content": f"Workspace contents: {listing}"
-    }
+            if not resp.tool_calls:
+                if not resp.content.strip():
+                    return "(the model returned an empty response)"
+                self.messages.append({"role": "assistant", "content": resp.content})
+                return resp.content
 
-
-# --------------------------------------------------------------------------- #
-# Parsing                                                                       #
-# --------------------------------------------------------------------------- #
-
-def _parse_response(response: str) -> list[dict] | str:
-    stripped = response.strip()
-
-    try:
-        data = json.loads(stripped)
-    except json.JSONDecodeError:
-        return stripped
-
-    # CASE 1: list of tool calls
-    if isinstance(data, list):
-        calls = [
-            item for item in data
-            if isinstance(item, dict)
-            and "tool" in item
-            and "arguments" in item
-        ]
-        return calls if calls else stripped
-
-    # CASE 2: single tool call object
-    if isinstance(data, dict):
-        if "tool" in data and "arguments" in data:
-            return [data]
-        return stripped
-
-    return stripped
-
-
-# --------------------------------------------------------------------------- #
-# Context trimming                                                              #
-# --------------------------------------------------------------------------- #
-
-def _trim_tool_result(result: dict) -> str:
-    serialized = json.dumps(result, ensure_ascii=False)
-    if len(serialized) <= TOOL_RESULT_TRIM:
-        return serialized
-
-    if isinstance(result.get("result"), str):
-        trimmed = result.copy()
-        trimmed["result"] = (
-            result["result"][:TOOL_RESULT_TRIM]
-            + f"\n... [trimmed, {len(result['result'])} chars total]"
-        )
-        return json.dumps(trimmed, ensure_ascii=False)
-
-    return serialized[:TOOL_RESULT_TRIM] + " ... [trimmed]"
-
-
-# --------------------------------------------------------------------------- #
-# Main run loop                                                                 #
-# --------------------------------------------------------------------------- #
-
-def run(user_input: str) -> str:
-    messages: list[dict] = [
-        _system_prompt(),
-        _initial_context(),
-        {"role": "user", "content": user_input},
-    ]
-
-    executed: set[tuple] = set()
-
-    last_response = None
-
-    for step in range(MAX_STEPS):
-        if on_step:
-            on_step(step)
-
-        response = ask_llm(messages)
-        if response == last_response:
-            messages.append({
-                "role": "user",
-                "content": (
-                    "You repeated exactly the same response. "
-                    "Use the previous results and move forward."
-                ),
-            })
-            continue
-
-        last_response = response
-        parsed = _parse_response(response)
-
-        if isinstance(parsed, str):
-            return parsed
-
-        tool_calls: list[dict] = parsed
-
-        available_tools = set(get_tools_list())
-
-        invalid_calls = [
-            call["tool"]
-            for call in tool_calls
-            if call["tool"] not in available_tools
-        ]
-
-        if invalid_calls:
-            messages.append({"role": "assistant", "content": response})
-            messages.append({
-                "role": "user",
-                "content": (
-                    f"You attempted to call unknown tool(s): {', '.join(invalid_calls)}.\n"
-                    f"Available tools: {', '.join(sorted(available_tools))}.\n"
-                    "Reason internally and continue using only existing tools."
-                ),
-            })
-            continue
-
-        signature = tuple(
-            (c["tool"], json.dumps(c["arguments"], sort_keys=True))
-            for c in tool_calls
-        )
-
-        if signature in executed:
-            messages.append({"role": "assistant", "content": response})
-            messages.append({
-                "role": "user",
-                "content": (
-                    "You already executed exactly the same tool call(s). "
-                    "Do not repeat them. Use previous tool results and continue."
-                ),
-            })
-            continue
-
-        executed.add(signature)
-
-        messages.append({"role": "assistant", "content": response})
-
-        for call in tool_calls:
-            result = call_mcp(call["tool"], call.get("arguments", {}))
-            messages.append({
-                "role": "tool",
-                "name": call["tool"],
-                "content": _trim_tool_result(result),
+            self.messages.append({
+                "role": "assistant",
+                "content": resp.content,
+                "tool_calls": [{
+                    "id": c["id"],
+                    "type": "function",
+                    "function": {"name": c["name"],
+                                 "arguments": json.dumps(c["arguments"] or {}, ensure_ascii=False)},
+                } for c in resp.tool_calls],
             })
 
-    return f"Agent stopped: reached maximum steps ({MAX_STEPS})."
+            for call in resp.tool_calls:
+                result = self._execute(call, schemas, seen)
+                self.messages.append({
+                    "role": "tool",
+                    "tool_call_id": call["id"],
+                    "content": self._trim_tool_result(result),
+                    "_name": call["name"],
+                })
+
+        note = f"Agent stopped: reached maximum steps ({self.max_steps}). Say 'continue' to keep going."
+        self.messages.append({"role": "assistant", "content": note})
+        return note

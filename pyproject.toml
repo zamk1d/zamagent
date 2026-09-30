@@ -1,0 +1,14 @@
+[project]
+name = "zamagent"
+version = "0.1.0"
+dependencies = [
+    "rich",
+    "requests",
+    "python-dotenv",
+]
+
+[project.scripts]
+zamagent = "zamagent.zamagent:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/zamagent"]

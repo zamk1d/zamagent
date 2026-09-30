@@ -1,0 +1,16 @@
+README.md
+pyproject.toml
+src/__init__.py
+src/zamagent/__init__.py
+src/zamagent/agent.py
+src/zamagent/mcp_server.py
+src/zamagent/tool_helpers.py
+src/zamagent/tools.py
+src/zamagent/tools_inspector.py
+src/zamagent/zamagent.py
+src/zamagent.egg-info/PKG-INFO
+src/zamagent.egg-info/SOURCES.txt
+src/zamagent.egg-info/dependency_links.txt
+src/zamagent.egg-info/entry_points.txt
+src/zamagent.egg-info/requires.txt
+src/zamagent.egg-info/top_level.txt
