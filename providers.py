@@ -3,6 +3,7 @@ LLM providers for zamagent.
 
 * GroqProvider    - Groq Cloud (OpenAI-compatible, native tool calling, SSE streaming)
 * NvidiaProvider  - NVIDIA NIM / build.nvidia.com (OpenAI-compatible, NVIDIA_API_KEY)
+* GeminiProvider  - Google Gemini via its OpenAI-compatible endpoint (GEMINI_API_KEY)
 * OllamaProvider  - local Ollama (/api/chat, native tool calling)
 * OpenAICompatProvider - any other OpenAI-compatible endpoint (OPENAI_BASE_URL)
 
@@ -279,10 +280,17 @@ def _stream_chunk(provider, data: str, parts: list, calls: dict, usage: dict,
             if on_token:
                 on_token(text)
         for tc in delta.get("tool_calls") or []:
-            entry = calls.setdefault(tc.get("index", 0), {"id": "", "name": "", "args": ""})
+            fn = tc.get("function") or {}
+            idx = tc.get("index")
+            if idx is None:
+                # Gemini's OpenAI layer may omit "index": a chunk that names a function is a
+                # new call, a chunk with only argument pieces continues the last one.
+                idx = len(calls) if (fn.get("name") or not calls) else max(calls)
+            entry = calls.setdefault(idx, {"id": "", "name": "", "args": ""})
             if tc.get("id"):
                 entry["id"] = tc["id"]
-            fn = tc.get("function") or {}
+            if tc.get("extra_content"):          # Gemini 3 "thought_signature": must be echoed back
+                entry["extra"] = tc["extra_content"]
             if fn.get("name") and not entry["name"]:
                 entry["name"] = fn["name"]
             piece = fn.get("arguments")
@@ -311,6 +319,9 @@ class OpenAICompatProvider(Provider):
     # -- hooks -------------------------------------------------------------- #
     def extra_params(self) -> dict:
         return {}
+
+    def prepare_tools(self, tools: list[dict]) -> list[dict]:
+        return tools
 
     def _headers(self) -> dict:
         if not self.api_key:
@@ -378,10 +389,13 @@ class OpenAICompatProvider(Provider):
                     f"fish: set -e {self.env_key}) so .env is used.", 401)
 
             if status in (429, 500, 502, 503, 504):
+                if status == 429 and re.search(r"per ?day|daily", message, re.I):
+                    raise ProviderError(f"daily quota exhausted: {message}", status)
                 try:
                     wait = float(resp.headers.get("retry-after", ""))
                 except ValueError:
-                    wait = delay
+                    m = re.search(r"retry in ([\d.]+)s", message)      # Gemini puts it in the body
+                    wait = float(m.group(1)) + 1 if m else delay
                 if wait > 60:
                     raise ProviderError(
                         f"rate limit reached, the API asks to wait {wait:.0f}s: {message}", status)
@@ -402,7 +416,7 @@ class OpenAICompatProvider(Provider):
             "temperature": self.temperature,
         }
         if tools:
-            payload["tools"] = tools
+            payload["tools"] = self.prepare_tools(tools)
             payload["tool_choice"] = "auto"
         payload.update(self.extra_params())
 
@@ -456,12 +470,15 @@ class OpenAICompatProvider(Provider):
             c = calls[idx]
             if not c["name"]:
                 continue
-            tool_calls.append({
+            call = {
                 "id": c["id"] or _new_id(),
                 "name": c["name"],
                 "arguments": _parse_args(c["args"]),
                 "raw": c["args"],
-            })
+            }
+            if c.get("extra"):
+                call["extra_content"] = c["extra"]
+            tool_calls.append(call)
         return LLMResponse(_strip_think("".join(parts)), tool_calls, usage)
 
     def list_models(self) -> list[str]:
@@ -501,23 +518,20 @@ class GroqProvider(OpenAICompatProvider):
         return super()._headers()
 
 
-class NvidiaProvider(OpenAICompatProvider):
-    """NVIDIA NIM API (https://build.nvidia.com). Key: https://build.nvidia.com/settings/api-keys
+class DiscoveringProvider(OpenAICompatProvider):
+    """Provider whose model list changes often (NVIDIA, Gemini): finds a working model by itself.
 
     NVIDIA removes models from the free endpoint often (HTTP 410 "end of life"), so the
     default model is "auto": the first request probes the models of /v1/models and picks
     one that answers and supports tool calling. If the current model turns 410 mid-session,
     the provider switches to another working one and retries.
     """
-    name = "nvidia"
-    default_base_url = "https://integrate.api.nvidia.com/v1"
-    env_key = "NVIDIA_API_KEY"
-    env_base_url = "NVIDIA_BASE_URL"
-    key_hint = "NVIDIA keys start with 'nvapi-'."
-    tool_result_limit = 10_000
     context_chars = 150_000
 
     AUTO = "auto"
+    DEFAULT_MODEL = "auto"          # "auto" = probe on first use; any other id = try it first
+    key_url = ""
+    PROBE_OK = (200, 429)           # 429 = model exists, just rate limited
     # earlier = preferred; matched as substrings of the model id
     PREFER = ("kimi-k2", "deepseek", "glm", "qwen3", "qwen", "gpt-oss", "mistral",
               "minimax", "nemotron", "llama", "gemma")
@@ -527,28 +541,28 @@ class NvidiaProvider(OpenAICompatProvider):
     MAX_PROBES = 20
 
     def __init__(self, model: str | None = None, **kw):
-        super().__init__(model or self.AUTO, **kw)
+        super().__init__(model or self.DEFAULT_MODEL, **kw)
         self._pinned = bool(model) and model != self.AUTO      # user chose the model: never swap it silently on timeouts
         self._dead: set[str] = set()
 
     def _headers(self) -> dict:
         if not self.api_key:
             raise ProviderError(
-                "NVIDIA_API_KEY is not set. Get a key at https://build.nvidia.com/settings/api-keys "
+                f"{self.env_key} is not set. Get a key at {self.key_url} "
                 "and put it into .env (see .env.example)."
             )
         return super()._headers()
 
     # -- model discovery ---------------------------------------------------- #
+    def _rank(self, m: str) -> int:
+        for i, key in enumerate(self.PREFER):
+            if key in m.lower():
+                return i
+        return len(self.PREFER)
+
     def _candidates(self) -> list[str]:
         ids = [m for m in self.list_models() if m not in self._dead and not self.SKIP.search(m)]
-
-        def rank(m: str) -> int:
-            for i, key in enumerate(self.PREFER):
-                if key in m.lower():
-                    return i
-            return len(self.PREFER)
-        return sorted(ids, key=lambda m: (rank(m), m))
+        return sorted(ids, key=lambda m: (self._rank(m), m))
 
     def _probe(self, model: str, timeout: float = 20) -> bool:
         """True when the model answers a 1-token request that carries a tool definition."""
@@ -592,13 +606,13 @@ class NvidiaProvider(OpenAICompatProvider):
         status = r.status_code
         _dbg(f"probe {model}: HTTP {status} in {secs:.1f}s body={r.text[:200]!r}", console=False)
         r.close()
-        return status in (200, 429), str(status), secs   # 429 = exists, just rate limited
+        return status in self.PROBE_OK, str(status), secs
 
     FAST_ENOUGH = 10.0   # seconds a probe may take to still count as "fast"
 
     def find_working_model(self) -> str:
         """Probe candidates in parallel; take the most preferred one that answers fast."""
-        _say("nvidia: looking for a fast working model ...")
+        _say(f"{self.name}: looking for a fast working model ...")
         rows = self.probe_all(limit=self.MAX_PROBES, timeout=15)
         good = [r for r in rows if r[3]]
         for model, status, secs, ok in rows:
@@ -606,18 +620,13 @@ class NvidiaProvider(OpenAICompatProvider):
                 self._dead.add(model)
         if not good:
             raise ProviderError(
-                "no working NVIDIA chat model answered in time (the free endpoint may be "
-                "overloaded). Try again later, or run `python zamagent.py -p nvidia --probe`.")
+                f"no working {self.name} chat model answered in time (rate limit, quota or "
+                f"overload). Try again later, or run `zamagent -p {self.name} --probe`.")
         fast = [r for r in good if r[2] <= self.FAST_ENOUGH] or good
 
-        def rank(m: str) -> int:
-            for i, key in enumerate(self.PREFER):
-                if key in m.lower():
-                    return i
-            return len(self.PREFER)
-        best = min(fast, key=lambda r: (rank(r[0]), r[2]))
+        best = min(fast, key=lambda r: (self._rank(r[0]), r[2]))
         self.model = best[0]
-        _say(f"nvidia: using {best[0]} ({best[2]:.1f}s probe)")
+        _say(f"{self.name}: using {best[0]} ({best[2]:.1f}s probe)")
         return best[0]
 
     # -- chat with fallback ------------------------------------------------- #
@@ -632,10 +641,64 @@ class NvidiaProvider(OpenAICompatProvider):
             if not (gone or slow):
                 raise
             why = f"is gone ({exc.status})" if gone else "is not answering"
-            _say(f"nvidia: {self.model} {why}, looking for another model")
+            _say(f"{self.name}: {self.model} {why}, looking for another model")
             self._dead.add(self.model)
             self.find_working_model()
             return super().chat(messages, tools, on_token)
+
+
+class NvidiaProvider(DiscoveringProvider):
+    """NVIDIA NIM API (https://build.nvidia.com)."""
+    name = "nvidia"
+    default_base_url = "https://integrate.api.nvidia.com/v1"
+    env_key = "NVIDIA_API_KEY"
+    env_base_url = "NVIDIA_BASE_URL"
+    key_hint = "NVIDIA keys start with 'nvapi-'."
+    key_url = "https://build.nvidia.com/settings/api-keys"
+
+
+def _strip_schema_keys(node, drop=("additionalProperties", "$schema")):
+    if isinstance(node, dict):
+        return {k: _strip_schema_keys(v, drop) for k, v in node.items() if k not in drop}
+    if isinstance(node, list):
+        return [_strip_schema_keys(v, drop) for v in node]
+    return node
+
+
+class GeminiProvider(DiscoveringProvider):
+    """Google Gemini through its OpenAI-compatible endpoint. Key: https://aistudio.google.com/api-keys
+
+    Notes: free-tier requests may be used by Google to improve its products (paid tier: not).
+    Model ids come back as "models/<id>"; Gemini 3 needs "thought signatures" echoed back
+    (handled via extra_content on tool calls).
+    """
+    name = "gemini"
+    default_base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+    env_key = "GEMINI_API_KEY"
+    env_base_url = "GEMINI_BASE_URL"
+    key_hint = "Create a key at https://aistudio.google.com/api-keys."
+    key_url = "https://aistudio.google.com/api-keys"
+    DEFAULT_MODEL = "gemini-2.5-flash"
+    PROBE_OK = (200,)   # on the free tier a paid-only model answers 429 with "limit: 0"
+    tool_result_limit = 12_000
+    context_chars = 300_000
+    PREFER = ("gemini-2.5-flash", "gemini-2.5-pro", "gemini-3", "flash", "pro", "gemini")
+    SKIP = re.compile(r"embed|tts|image|live|audio|imagen|veo|aqa|learnlm|gemma|robotics|"
+                      r"computer-use|deep-research|gemini-1\.|gemini-2\.0|nano-banana", re.I)
+
+    def __init__(self, model: str | None = None, **kw):
+        kw.setdefault("api_key", os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "")
+        super().__init__(model, **kw)
+
+    def _rank(self, m: str) -> int:
+        penalty = 3 if re.search(r"lite|preview|exp|latest", m, re.I) else 0
+        return super()._rank(m) * 10 + penalty
+
+    def list_models(self) -> list[str]:
+        return sorted({i.removeprefix("models/") for i in super().list_models()})
+
+    def prepare_tools(self, tools: list[dict]) -> list[dict]:
+        return _strip_schema_keys(tools)
 
 
 # --------------------------------------------------------------------------- #
@@ -746,7 +809,7 @@ class OllamaProvider(Provider):
 # Factory                                                                      #
 # --------------------------------------------------------------------------- #
 
-PROVIDERS = ("groq", "nvidia", "ollama", "openai")
+PROVIDERS = ("groq", "nvidia", "gemini", "ollama", "openai")
 
 
 def default_provider_name() -> str:
@@ -757,6 +820,8 @@ def default_provider_name() -> str:
         return "groq"
     if os.getenv("NVIDIA_API_KEY"):
         return "nvidia"
+    if os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"):
+        return "gemini"
     return "ollama"
 
 
@@ -768,6 +833,8 @@ def make_provider(name: str | None = None, model: str | None = None) -> Provider
         return GroqProvider(model or os.getenv("GROQ_MODEL") or "openai/gpt-oss-120b")
     if name == "nvidia":
         return NvidiaProvider(model or os.getenv("NVIDIA_MODEL") or None)
+    if name == "gemini":
+        return GeminiProvider(model or os.getenv("GEMINI_MODEL") or None)
     if name == "ollama":
         return OllamaProvider(model or os.getenv("OLLAMA_MODEL") or "qwen3:8b")
     if name in ("openai", "custom"):

@@ -349,6 +349,7 @@ Reply in the language the user writes in. Be concise: say what you did / found a
                     "type": "function",
                     "function": {"name": c["name"],
                                  "arguments": json.dumps(c["arguments"] or {}, ensure_ascii=False)},
+                    **({"extra_content": c["extra_content"]} if c.get("extra_content") else {}),
                 } for c in resp.tool_calls],
             })
 
